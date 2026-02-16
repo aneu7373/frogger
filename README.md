@@ -1,311 +1,241 @@
 # 🐸 FROGGER  
 **Fragmented Recombined Orfs, Golden Gate Excision Ready**
 
-FROGGER is a deterministic, Dockerized bioinformatics pipeline for:
+FROGGER is a unified, Dockerized **Golden Gate fragment library generator** for protein engineering workflows. It provides a single CLI with two complementary modes:
 
-1. Codon optimization and back-translation via `codonopt`
-2. Splitting optimized ORFs into user-defined fragments
-3. Adding Golden Gate cloning adapters to each fragment
-4. Reassembling fragments into all valid recombinant ORFs while preserving fragment order
-5. Validating the final post-ligation ORFs against biological and user-defined constraints
+- **`frogger shuffle`** — recombination / shuffling across homologous proteins (legacy FROGGER)
+- **`frogger mutate`** — site-saturation / targeted mutagenesis with **single-mutation** fragment pooling + assembly plan (ported from SLOGGER)
 
-FROGGER is designed for library construction, modular gene design, and high-throughput cloning workflows where correctness, auditability, and reproducibility matter.
+Both workflows converge on the same shared Golden Gate (GG) packaging logic: junction-aware overhang selection, forced codons to realize junction overhangs, adapter/primer construction, and audit reporting.
 
 ---
 
-## Why FROGGER exists
+## What FROGGER does
 
-Codon optimization alone is not sufficient for modern cloning pipelines.
+Given protein sequences (and a configuration describing split points and GG constraints), FROGGER produces GG-ready fragment libraries that:
 
-Once ORFs are fragmented, recombined, and ligated, new biological artifacts can be introduced, including:
-
-- forbidden motifs (for example restriction sites)
-- unexpected homopolymers
-- frameshifts or internal stop codons
-- GC drift
-- junction-created patterns that never existed in the original sequences
-
-FROGGER explicitly models the post-ligation ORF, not just the individual fragments, and verifies that nothing unwanted was introduced during the design process.
+- are **codon-optimized** (via `codonopt`)
+- are split into **Golden Gate fragments** at user-defined AA cut points
+- use **junction-aware overhang selection** with a crosstalk scoring matrix + filters + beam search
+- **force junction codons** so chosen overhangs are realizable in the final DNA
+- generate **GG cloning-ready fragments** with enzyme sites, spacers, overhangs, and primers
+- (mutate) produce **fragment pools** that assemble into **only single-mutant constructs**
+- emit audit artifacts (overhang choice, crosstalk, reports)
 
 ---
 
-## Core capabilities
+## Quick start (Docker)
 
-### Codon optimization
+### Build
 
-- Uses codonopt version 1.2 (vendored as a git submodule)
-- Supports:
-  - protein FASTA or CDS FASTA
-  - batch CSV or TSV input
-  - deterministic runs via seed
-  - bounded backtracking mode called `kleinbub` or strict optimization
-  - CryptKeeper filtering as an optional screening step
+From the repo root:
 
-### Fragmentation
+    docker build -t frogger:0.3 .
 
-- User-defined cut points, either global for all sequences or per-gene
-- Optional frame enforcement so cut points must be multiples of 3
-- Produces:
-  - core coding fragments used for reassembly and post-ligation validation
-  - cloning-ready fragments that include user-defined adapters
+### Run (recommended workflow)
 
-### Golden Gate preparation
+Mount a local folder that contains your config and input FASTA files:
 
-- Adds user-specified adapters to each fragment
-- Adapters are output-only and are not scanned or validated
-- Clean separation between:
-  - cloning fragments that include adapters
-  - post-ligation ORFs that exclude adapters and represent the biological coding sequence
+    docker run --rm -v "/path/to/examples:/examples" frogger:0.3 shuffle --config /examples/config_unified.yaml --outdir /examples/out_shuffle
 
-### Recombinant assembly
+    docker run --rm -v "/path/to/examples:/examples" frogger:0.3 mutate --config /examples/config_unified.yaml --outdir /examples/out_mutate
 
-- Reassembles fragments into all valid combinations
-- Fragment order is preserved
-- Fragment sources may mix across genes
-- Deterministic random sampling is used when the number of combinations is too large to enumerate exhaustively
-
-### Final validation on the post-ligation ORF
-
-- Scans the assembled post-ligation ORF for:
-  - forbidden motifs
-  - GC bounds
-  - homopolymer limits
-  - internal stop codons
-  - frame integrity
-- Reports exact motif locations and sequence context
-- Ensures biological correctness of every accepted construct
+Notes:
+- Use absolute paths for the `-v` mount.
+- Output directories should be distinct per run to avoid overwrites.
 
 ---
 
-## Repository structure
+## Installation (from source)
 
-This repository uses two repos in one workspace via a git submodule.
+FROGGER is primarily used via Docker, but can be run locally if you prefer.
 
-```text
-frogger-repo/
-  codonopt/        # git submodule (codonopt v1.2)
-  frogger/         # FROGGER pipeline
-    Dockerfile
-    requirements.txt
-    FROGGER.schema.md
-    frogger/
-      cli.py
-      pipeline.py
-      util.py
-      splitters.py
-      gg_adapters.py
-      recombine.py
-      checks.py
-      report.py
-      io.py
-```
+### Clone with submodules (codonopt)
 
----
+This repo expects `codonopt` at the repo root path `./codonopt` (as a git submodule).
 
-## Installation and setup
+Clone with submodules:
 
-### Clone (important: submodules)
+    git clone --recurse-submodules <YOUR_FROGGER_REPO_URL>
+    cd frogger
 
-```bash
-git clone --recurse-submodules https://github.com/<your-org>/<frogger-repo>.git
-cd <frogger-repo>
-```
+Or initialize after cloning:
 
-If you already cloned without submodules, run:
+    git submodule update --init --recursive
 
-```bash
-git submodule update --init --recursive
-```
+### Python environment
+
+From the repo root:
+
+    python -m venv .venv
+    source .venv/bin/activate
+    pip install -r frogger_app/requirements.txt
+
+Then run the CLI (see “Usage”).
 
 ---
 
-## Build the Docker image
+## Repository layout
 
-From the repository root, run:
-
-```bash
-docker build -t frogger:0.1 -f frogger/Dockerfile .
-```
-
-This image bundles:
-
-- FROGGER
-- codonopt version 1.2
-- all runtime dependencies
-
-No conda. No Docker-in-Docker.
+- `frogger_app/`
+  - `frogger/` — main Python package
+    - `modules/shuffle/` — shuffle workflow
+    - `modules/mutate/` — mutate workflow
+    - `common/gg/` — shared Golden Gate helpers (splitters, packager)
+    - `primers.py`, `overhangs.py`, `junction_overhangs.py`, `gg_adapters.py` — core shared GG logic
+- `codonopt/` — codon optimization engine (git submodule)
+- `examples/` — example configs and inputs
 
 ---
 
-## Running FROGGER
+## Unified configuration
 
-### Basic invocation
+A single YAML config (commonly `config_unified.yaml`) drives either mode. Typical blocks:
 
-```bash
-docker run --rm \
-  -v "$PWD/in:/in" \
-  -v "$PWD/out:/out" \
-  frogger:0.1 \
-  run --config /in/pipeline.yaml --outdir /out
-```
-
-### Required inputs
-
-- `pipeline.yaml` for full pipeline configuration
-- input FASTA (protein or CDS)
-- codon table XLSX (if not using batch mode)
+- `inputs` — FASTA paths and input interpretation
+- `codonopt` — codon optimization settings
+- `splits` — AA cut points (shuffle uses directly; mutate uses to derive nt cuts)
+- `golden_gate` — overhang matrix path, filters, beam search settings
+  - `golden_gate.fragments` — enzyme, spacers, etc.
+  - `golden_gate.max_worst_crosstalk` — worst allowed crosstalk threshold (default often `0.1`)
+- `primers` — fixed or generated; motif avoidance / kmer avoidance
+- `outputs` — output filenames (TSVs/FASTAs)
+- `repair` — optional post-generation QC + repair (see below)
 
 ---
 
-## Configuration overview
+## Usage
 
-The pipeline is fully controlled by a single YAML file.
+FROGGER exposes a single `frogger` command with subcommands.
 
-Key sections:
+### Shuffle (recombination / shuffling)
 
-```yaml
-inputs:            # input FASTA
-codonopt:          # codon optimization parameters
-splits:            # fragment boundaries
-golden_gate:       # cloning adapters
-reassembly:        # combinatorics and sampling
-final_checks:      # ORF validation
-final_forbidden:   # motifs banned post-ligation
-outputs:           # filenames
-```
+    frogger shuffle --config /path/to/config_unified.yaml --outdir /path/to/out_shuffle
 
-See `frogger/FROGGER.schema.md` for the complete schema.
+Shuffle produces GG-ready fragments representing recombined ORFs across a set of homologous proteins, with overhang selection optimized to minimize crosstalk.
 
----
+### Mutate (site-saturation / targeted mutagenesis)
 
-## Outputs
+    frogger mutate --config /path/to/config_unified.yaml --outdir /path/to/out_mutate
 
-All outputs are written to `--outdir`.
+Mutate produces:
+- wild-type fragments
+- mutant fragments
+- fragment pools such that assembly yields only **single-mutation** constructs
+- an `assembly_plan.tsv` mapping each variant to its required fragment combination
 
-### 1) Codonopt outputs
-
-Located in:
-
-```text
-out/codonopt_out/
-  optimized_sequences.fasta
-  metrics.tsv
-```
-
-### 2) Cloning fragments FASTA
-
-Output file:
-
-```text
-fragments_with_gg.fasta
-```
-
-Each sequence:
-
-- includes Golden Gate adapters
-- is ready for synthesis or cloning
-- header includes gene ID and fragment index
-
-### 3) Reassembled ORFs FASTA
-
-Output file:
-
-```text
-reassembled_orfs.fasta
-```
-
-Each sequence:
-
-- represents the post-ligation coding sequence
-- contains no adapters
-- header includes construct ID, fragment provenance, and PASS or FAIL status
-
-### 4) Main report
-
-Output file:
-
-```text
-report.tsv
-```
-
-One row per construct, including:
-
-- fragment provenance
-- ORF length
-- GC fraction
-- homopolymer statistics
-- pass or fail status
-- failure reasons
-- seeds used
-- codonopt version
-
-### 5) Motif hit report
-
-Output file:
-
-```text
-junction_hits.tsv
-```
-
-Lists every forbidden motif detected, with:
-
-- exact position
-- sequence context
-- source construct
+Important behavior:
+- Full saturation (default) skips mutating amino acid position 1 (start codon) by default.
 
 ---
 
-## Determinism and reproducibility
+## Golden Gate packaging (shared behavior)
 
-FROGGER is fully deterministic when seeds are provided.
+Both workflows share the same GG packaging steps:
 
-- Codon optimization seed
-- Reassembly sampling seed
-- Config hash (implicit via git)
-
-Re-running with the same config, codonopt version, and seeds will produce bit-identical outputs.
+1. Enumerate overhang candidates from synonymous codon choices at junction AAs
+2. Optimize a global overhang assignment using:
+   - pairing/crosstalk matrix scoring
+   - filters
+   - beam search
+3. Force codons at junction AA indices to realize chosen overhangs
+4. Build cloning sequences:
+   - enzyme recognition sites
+   - overhangs
+   - spacers
+   - primers (fixed or generated)
+5. Emit audit files, including:
+   - selected overhangs per junction
+   - pairwise crosstalk scores
+   - fail-fast if worst crosstalk exceeds `golden_gate.max_worst_crosstalk`
 
 ---
 
-## Common use cases
+## Post-generation QC + repair (optional)
 
-- Modular Golden Gate library construction
-- Large-scale ORF recombination experiments
-- Avoidance of restriction sites across ligation junctions
-- Synthetic gene design under strict biological constraints
-- Auditable, production-grade DNA design workflows
+Some outputs (especially shuffle) can occasionally violate downstream synthesis/assembly constraints such as:
+- excessive homopolymer runs
+- forbidden motifs
+- internal restriction enzyme sites
+
+FROGGER supports an optional **QC + repair** pass that:
+1. Scans fragment cores (and/or ORFs, depending on implementation) for constraint violations
+2. If failures exist, re-runs codon optimization **only on failing sequences**
+3. Validates **AA preservation** (translation must match exactly)
+4. Re-applies junction forced codons (when repairing fragment cores)
+5. Regenerates downstream packaging so results remain Golden Gate compatible
+6. Writes a clear `repair_report.tsv` describing what changed and what still fails
+
+### Example config block
+
+    repair:
+      enable: true
+      max_rounds: 1
+      qc:
+        max_homopolymer: 5
+        forbidden_motifs: ["AAAAAA", "TTTTTT"]
+        internal_sites:
+          - {name: "BsaI", site: "GGTCTC"}
+          - {name: "BsmBI", site: "CGTCTC"}
+
+### Repair report
+
+When enabled and any repairs are attempted, FROGGER writes:
+
+- `repair_report.tsv` (name configurable via `outputs.repair_report_tsv`)
+
+Typical columns include:
+- fragment/record id
+- round number
+- failures before/after
+- whether AA was preserved
+- whether the nucleotide sequence changed
+- codonopt version (if available)
 
 ---
 
-## Design philosophy
+## Outputs (typical)
 
-- Post-ligation biology matters
-- Fragments are not genes
-- Constraints must be re-checked after every transformation
-- Sampling must be deterministic
-- Pipelines must be auditable
+Exact filenames are controlled by the `outputs` section in the config, but commonly include:
 
-FROGGER encodes these principles explicitly.
+- FASTA files:
+  - GG-ready fragments (with adapters/primers)
+  - reconstructed ORFs (where applicable)
+  - mutant variant sequences (mutate)
+- TSV reports:
+  - pipeline report summary
+  - junction/overhang audit
+  - overhang crosstalk table
+  - (mutate) assembly plan and pooling tables
+  - (optional) repair report
 
 ---
 
 ## Development notes
 
-- `codonopt` is treated as read-only in this repo
-- To update codonopt:
+- `codonopt` is a git submodule at `./codonopt`.
+- If you update the codonopt submodule pointer:
 
-```bash
-cd codonopt
-git fetch
-git checkout <new-tag-or-commit>
-cd ..
-git add codonopt
-git commit -m "Update codonopt submodule"
-```
+    cd codonopt
+    git fetch
+    git checkout <new_commit_or_tag>
+    cd ..
+    git add codonopt
+    git commit -m "Bump codonopt submodule"
+    git push
+
+- For reproducibility, keep deterministic seeds consistent in config and/or pipeline defaults.
 
 ---
 
-## License and status
+## Troubleshooting
 
-- FROGGER: project-defined license
-- codonopt: see the codonopt repository
+### Submodule not present
+If builds fail because `codonopt` is missing, initialize submodules:
+
+    git submodule update --init --recursive
+
+### Docker build is missing codonopt
+If you add a `.dockerignore`, ensure it does not exclude `codonopt/`.
+
+---
