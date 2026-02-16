@@ -1,0 +1,34 @@
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# VCS
+.git/
+.gitmodules.bak
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build / outputs
+**/dist/
+**/build/
+**/*.egg-info/
+**/out*/
+**/outputs*/
+**/*.log
+
+# Data files (optional—keep if you truly don't need them during build)
+# **/*.fasta
+# **/*.fa
+# **/*.fastq
+# **/*.tsv
+# **/*.csv
+/examples
