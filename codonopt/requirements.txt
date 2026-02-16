@@ -1,6 +1,0 @@
-biopython
-pandas
-openpyxl
-tqdm
-numpy
-cryptkeeper
