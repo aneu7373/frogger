@@ -1,0 +1,3 @@
+[submodule "codonopt"]
+	path = codonopt
+	url = https://github.com/aneu7373/codonopt
