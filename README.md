@@ -30,15 +30,15 @@ Given protein sequences (and a configuration describing split points and GG cons
 
 From the repo root:
 
-    docker build -t frogger:0.3 .
+    docker build -t frogger:1.0 .
 
 ### Run (recommended workflow)
 
 Mount a local folder that contains your config and input FASTA files:
 
-    docker run --rm -v "/path/to/examples:/examples" frogger:0.3 shuffle --config /examples/config_unified.yaml --outdir /examples/out_shuffle
+    docker run --rm -v "/path/to/examples:/examples" frogger:1.0 shuffle --config /examples/config_unified.yaml --outdir /examples/out_shuffle
 
-    docker run --rm -v "/path/to/examples:/examples" frogger:0.3 mutate --config /examples/config_unified.yaml --outdir /examples/out_mutate
+    docker run --rm -v "/path/to/examples:/examples" frogger:1.0 mutate --config /examples/config_unified.yaml --outdir /examples/out_mutate
 
 Notes:
 - Use absolute paths for the `-v` mount.
