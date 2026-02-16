@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Outputs
+out/
+results/
+codonopt_out/
+examples/
+
+# Large bio files
+*.fastq
+*.fq
+*.bam
+*.cram
+*.fasta
+*.fa
+*.fna
+*.gb
+*.gbk
+*.xlsx
+*.csv
+*.tsv
