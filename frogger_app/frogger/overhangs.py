@@ -32,6 +32,8 @@ class OverhangFilters:
 
 
 def _max_homopolymer_run(seq: DNA) -> int:
+    if not seq:
+        return 0
     best = 1
     cur = 1
     for i in range(1, len(seq)):
@@ -85,10 +87,30 @@ def symmetric_pair_score(df: pd.DataFrame, a: DNA, b: DNA) -> float:
     v2 = float(df.loc[b, a])
     return max(v1, v2)
 
+
+def rc_aware_pair_score(df: pd.DataFrame, a: DNA, b: DNA) -> float:
+    """
+    RC-aware scoring:
+      - score (a, b) AND also against the reverse-complement representations.
+    We conservatively take the worst (maximum) score across:
+      (a, b), (a, rc(b)), (rc(a), b), (rc(a), rc(b))
+    """
+    a = a.upper()
+    b = b.upper()
+    ra = revcomp(a)
+    rb = revcomp(b)
+    return max(
+        symmetric_pair_score(df, a, b),
+        symmetric_pair_score(df, a, rb),
+        symmetric_pair_score(df, ra, b),
+        symmetric_pair_score(df, ra, rb),
+    )
+
+
 def crosstalk_rows(df: pd.DataFrame, assign: Dict[int, DNA]) -> List[Dict[str, object]]:
     """
     Build pairwise cross-talk rows for a chosen overhang assignment.
-    Uses the same symmetric scoring as the search (max of both directions).
+    Uses the same RC-aware scoring as the search.
     """
     items = sorted(assign.items(), key=lambda kv: kv[0])
     overhangs = [oh for _pos, oh in items]
@@ -101,11 +123,12 @@ def crosstalk_rows(df: pd.DataFrame, assign: Dict[int, DNA]) -> List[Dict[str, o
                 {
                     "overhang_a": a,
                     "overhang_b": b,
-                    "score": float(symmetric_pair_score(df, a, b)),
+                    "score": float(rc_aware_pair_score(df, a, b)),
                 }
             )
     rows.sort(key=lambda r: r["score"], reverse=True)
     return rows
+
 
 def choose_overhangs_by_position(
     df: pd.DataFrame,
@@ -114,14 +137,15 @@ def choose_overhangs_by_position(
     beam_width: int = 200,
 ) -> Tuple[Dict[int, DNA], float]:
     """
-    Choose one overhang per position from candidates_by_pos, minimizing the maximum symmetric cross-talk score
-    among all chosen overhangs. Enforces all chosen overhangs are distinct.
+    Choose one overhang per position from candidates_by_pos, minimizing the maximum RC-aware cross-talk score
+    among all chosen overhangs.
 
-    candidates_by_pos: {pos_index: [4mers...]} pos_index is in assembly order (0..k).
-    Returns ({pos: overhang}, worst_pair_score)
+    Enforces:
+      - chosen overhangs are distinct
+      - chosen overhangs cannot be reverse-complements of each other
     """
     flt = filters or OverhangFilters()
-    # Pre-filter candidates per position
+
     filtered: Dict[int, List[DNA]] = {}
     for pos, cands in candidates_by_pos.items():
         filtered[pos] = filter_overhangs(cands, flt)
@@ -130,27 +154,21 @@ def choose_overhangs_by_position(
 
     positions = sorted(filtered.keys())
 
-    # Precompute pair score cache for all overhangs that appear
-    all_oh = sorted(set([oh for pos in positions for oh in filtered[pos]]))
-    pair_cache: Dict[Tuple[DNA, DNA], float] = {}
-    for i, a in enumerate(all_oh):
-        for b in all_oh[i + 1 :]:
-            pair_cache[(a, b)] = symmetric_pair_score(df, a, b)
-
     def pair(a: DNA, b: DNA) -> float:
         if a == b:
             return float("inf")
-        x, y = (a, b) if a < b else (b, a)
-        return pair_cache[(x, y)]
+        if a == revcomp(b) or revcomp(a) == b:
+            return float("inf")
+        return float(rc_aware_pair_score(df, a, b))
 
-    # Beam states are (assignment_dict, chosen_list, worst_so_far)
-    beam = [({}, [], 0.0)]
+    beam: List[Tuple[Dict[int, DNA], List[DNA], float]] = [({}, [], 0.0)]
     for pos in positions:
-        new_beam = []
+        new_beam: List[Tuple[Dict[int, DNA], List[DNA], float]] = []
         for assign, chosen, worst in beam:
             chosen_set = set(chosen)
+            chosen_rc_set = set(revcomp(x) for x in chosen)
             for cand in filtered[pos]:
-                if cand in chosen_set:
+                if cand in chosen_set or cand in chosen_rc_set:
                     continue
                 new_worst = worst
                 for prev in chosen:
@@ -158,7 +176,7 @@ def choose_overhangs_by_position(
                 new_assign = dict(assign)
                 new_assign[pos] = cand
                 new_beam.append((new_assign, chosen + [cand], new_worst))
-        # Keep best states by worst score
+
         new_beam.sort(key=lambda x: x[2])
         beam = new_beam[: max(1, int(beam_width))]
 

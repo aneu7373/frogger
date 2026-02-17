@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -16,7 +17,6 @@ from frogger.recombine import generate_constructs
 from frogger.checks import check_construct
 from frogger.report import build_report_row, build_hit_rows
 from frogger.common.io import read_fasta_records, write_fasta_records, write_tsv
-
 
 
 def _load_aa_inputs(cfg: dict) -> List[tuple[str, str]]:
@@ -48,8 +48,90 @@ def _patch_forced_codons(cds: str, aa_len: int, forced_by_local_aa: Dict[int, st
         if pos < 0 or pos >= aa_len:
             continue
         i = pos * 3
-        arr[i:i+3] = list(codon.upper())
+        arr[i : i + 3] = list(codon.upper())
     return "".join(arr)
+
+
+def _require_terminal_overhangs(cfg: dict) -> Tuple[str, str]:
+    """
+    (2) Terminal overhangs are REQUIRED. If not provided, raise a hard error.
+    Supports legacy key names too.
+    """
+    gg = cfg.get("golden_gate", {}) or {}
+    fr = gg.get("fragments", {}) or {}
+
+    oh5 = fr.get("terminal_overhang_5p", fr.get("term_overhang_5p"))
+    oh3 = fr.get("terminal_overhang_3p", fr.get("term_overhang_3p"))
+
+    if not oh5 or not oh3:
+        raise ValueError(
+            "Terminal overhangs are required. Please set "
+            "golden_gate.fragments.terminal_overhang_5p and terminal_overhang_3p "
+            "(or legacy keys term_overhang_5p/term_overhang_3p)."
+        )
+    oh5 = str(oh5).upper().strip()
+    oh3 = str(oh3).upper().strip()
+    if len(oh5) != 4 or len(oh3) != 4:
+        raise ValueError("Terminal overhangs must be 4 bp each.")
+    return oh5, oh3
+
+
+def _apply_consensus_downstream_aas(
+    aa_records: List[Tuple[str, str]],
+    cut_points_by_gene: Dict[str, List[int]],
+) -> List[Tuple[str, str]]:
+    """
+    (5) If amino acids differ at a cut site between genes, use the most common in the set.
+        OK if this changes sequences (shuffle context).
+
+    Clarification with (1):
+      - We search the FIRST TWO amino acids AFTER the cut site.
+      - For a cut point cp (boundary between cp-1 | cp), downstream AAs are:
+          aa1 = aa[cp]
+          aa2 = aa[cp+1]
+      - We compute consensus aa1/aa2 across genes and patch each AA record accordingly.
+    """
+    if len(aa_records) <= 1:
+        return aa_records
+
+    # Use the first gene as reference for number of cut points.
+    ref_gene = aa_records[0][0]
+    n_cuts = len(cut_points_by_gene[ref_gene])
+
+    # Compute consensus for each cut index.
+    consensus: Dict[int, Tuple[str, str]] = {}
+    for cut_idx in range(n_cuts):
+        c1 = Counter()
+        c2 = Counter()
+        for gene_id, aa in aa_records:
+            aa = aa.strip()
+            cuts = cut_points_by_gene[gene_id]
+            cp = int(cuts[cut_idx])
+            if cp < 0 or cp + 1 >= len(aa):
+                raise ValueError(
+                    f"Cut point {cp} invalid for downstream-AA window in '{gene_id}' length {len(aa)}. "
+                    "Cut points must allow two amino acids after the cut (cp <= len(aa)-2)."
+                )
+            c1[aa[cp]] += 1
+            c2[aa[cp + 1]] += 1
+
+        # deterministic tiebreaker
+        aa1 = sorted(c1.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        aa2 = sorted(c2.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        consensus[cut_idx] = (aa1, aa2)
+
+    # Apply patches
+    patched: List[Tuple[str, str]] = []
+    for gene_id, aa in aa_records:
+        aa = aa.strip()
+        arr = list(aa)
+        cuts = cut_points_by_gene[gene_id]
+        for cut_idx, (aa1, aa2) in consensus.items():
+            cp = int(cuts[cut_idx])
+            arr[cp] = aa1
+            arr[cp + 1] = aa2
+        patched.append((gene_id, "".join(arr)))
+    return patched
 
 
 def _select_global_overhangs_and_forced_codons(
@@ -57,12 +139,24 @@ def _select_global_overhangs_and_forced_codons(
     aa_records: List[Tuple[str, str]],
     n_fragments: int,
     cut_points_by_gene: Dict[str, List[int]],
-) -> Tuple[Dict[int, str], Dict[str, Dict[int, str]]]:
+) -> Tuple[Dict[int, str], Dict[str, Dict[int, str]], List[Tuple[str, str]]]:
     """
     Returns:
       - overhang_by_pos: {pos_index(0..k): 'ACGT'}
-      - forced_codons_by_gene: {gene_id: {aa_index: 'ATG', ...}}
+      - forced_codons_by_gene: {gene_id: {aa_index: 'ATG', ...}}  (internal junctions only)
+      - aa_records_patched: AA records possibly modified by consensus junction AA patching (shuffle)
+
+    Implements requested updates:
+      (1) Search FIRST TWO amino acids AFTER cut site (downstream) for internal junction overhang feasibility.
+      (2) 5' and 3' terminal overhangs are REQUIRED and hard-coded (not chosen by search).
+      (3) Compatibility scoring includes reverse complements (handled in frogger/overhangs.py).
+          Also double-check 3' block uses revcomp(overhang) (handled in gg_adapters.build_cloning_seq).
+      (4) Restrict codon search to top-K frequent codons per AA (default K=2; pulled from codon table entries).
+      (5) If amino acids differ at selected site between genes, use most common in the set (patch AA records).
     """
+    # Required terminal overhangs
+    term5, term3 = _require_terminal_overhangs(cfg)
+
     gg = cfg.get("golden_gate", {}) or {}
     matrix_path = gg.get("overhang_matrix_xlsx")
     if not matrix_path:
@@ -77,47 +171,68 @@ def _select_global_overhangs_and_forced_codons(
     codon_map = load_codon_usage_xlsx(Path(codon_table_path), sheet_name=c_cfg.get("codon_table_sheet"))
     avoid_codons = c_cfg.get("avoid_codons", []) or []
 
-    # For each junction position, compute candidate overhangs that are feasible for ALL genes
-    # Positions: 0 = N-term, 1..k-1 internal boundaries, k = C-term
+    # (4) top-k codons per AA for enumeration (default k=2)
+    search_cfg = (gg.get("overhang_search", {}) or {})
+    top_k = int(search_cfg.get("top_codons_per_aa", 2))
+    if top_k < 1:
+        top_k = 1
+
+    # (5) Patch AA records at junction downstream AAs to consensus across genes (shuffle assumption)
+    aa_records_patched = _apply_consensus_downstream_aas(aa_records, cut_points_by_gene)
+
+    # For each INTERNAL junction position (1..k-1), compute candidate overhangs feasible for ALL genes
+    # Positions:
+    #   0 = N-term fixed (term5)
+    #   1..k-1 internal boundaries chosen by search
+    #   k = C-term fixed (term3)
     candidates_by_pos: Dict[int, List[str]] = {}
     per_gene_choices: Dict[str, Dict[int, Dict[str, object]]] = {}
 
-    for gene_id, aa in aa_records:
+    for gene_id, aa in aa_records_patched:
         aa = aa.strip()
         cuts = cut_points_by_gene[gene_id]
-        if len(aa) < 2:
-            raise ValueError(f"Sequence '{gene_id}' too short for terminus overhang search (<2 aa).")
+        if len(cuts) != (n_fragments - 1):
+            raise ValueError(
+                f"Gene '{gene_id}' has {len(cuts)} cut points but n_fragments={n_fragments} "
+                f"(expected {n_fragments-1} cut points)."
+            )
 
-        boundaries: List[Tuple[int, str, str]] = []
-        # N-term uses aa[0], aa[1]
-        boundaries.append((0, aa[0], aa[1]))
-        # internal boundaries
-        for idx, cp in enumerate(cuts, start=1):
-            if cp <= 0 or cp >= len(aa):
-                raise ValueError(f"Cut point {cp} out of bounds for '{gene_id}' length {len(aa)}")
-            boundaries.append((idx, aa[cp - 1], aa[cp]))
-        # C-term uses last 2 aa
-        boundaries.append((len(cuts) + 1, aa[-2], aa[-1]))
+        # validate that downstream two-AA window exists for every cut
+        for cp in cuts:
+            if cp < 0 or cp + 1 >= len(aa):
+                raise ValueError(
+                    f"Cut point {cp} invalid for downstream-AA window in '{gene_id}' length {len(aa)}. "
+                    "Cut points must allow two amino acids after the cut (cp <= len(aa)-2)."
+                )
 
         per_gene_choices[gene_id] = {}
-        for pos_index, aL, aR in boundaries:
-            cand_map = enumerate_boundary_overhangs(aL, aR, codon_map, avoid_codons=avoid_codons)
+        for pos_index, cp in enumerate(cuts, start=1):
+            # (1) downstream two AAs after cut: aa[cp], aa[cp+1]
+            a1 = aa[cp]
+            a2 = aa[cp + 1]
+            cand_map = enumerate_boundary_overhangs(
+                a1,
+                a2,
+                codon_map,
+                avoid_codons=avoid_codons,
+                top_k_codons=top_k,
+            )
             per_gene_choices[gene_id][pos_index] = cand_map
 
-    # Intersect candidates across genes for each position
-    for pos_index in range(0, n_fragments + 1):
+    # Intersect candidates across genes for each INTERNAL position
+    for pos_index in range(1, n_fragments):
         keys = None
-        for gene_id, _aa in aa_records:
+        for gene_id, _aa in aa_records_patched:
             gene_cands = set(per_gene_choices[gene_id][pos_index].keys())
             keys = gene_cands if keys is None else (keys & gene_cands)
         if not keys:
             raise RuntimeError(
-                f"No feasible 4-mer overhangs exist at junction position {pos_index} "
+                f"No feasible 4-mer overhangs exist at internal junction position {pos_index} "
                 f"for all genes given the fixed cut points and codon table."
             )
         candidates_by_pos[pos_index] = sorted(keys)
 
-    # Choose one overhang per position minimizing cross-talk
+    # Choose one overhang per INTERNAL position minimizing cross-talk (RC-aware scoring in overhangs.py)
     flt_cfg = (gg.get("overhang_filters", {}) or {})
     flt = OverhangFilters(
         disallow_palindromes=bool(flt_cfg.get("disallow_palindromes", True)),
@@ -127,49 +242,45 @@ def _select_global_overhangs_and_forced_codons(
         max_homopolymer=int(flt_cfg.get("max_homopolymer", 3)),
     )
 
-    assign, worst = choose_overhangs_by_position(
+    internal_assign, worst = choose_overhangs_by_position(
         df=df,
         candidates_by_pos=candidates_by_pos,
         filters=flt,
         beam_width=int(gg.get("beam_width", 200)),
     )
 
+    # Full assignment includes required terminal overhangs
+    assign: Dict[int, str] = {0: term5, n_fragments: term3}
+    for pos_index, oh in internal_assign.items():
+        assign[int(pos_index)] = str(oh).upper()
+
     gg["_selected_overhangs_by_pos"] = assign
     gg["_selected_overhangs_worst_score"] = worst
     cfg["golden_gate"] = gg
 
-    # Now, for each gene, choose concrete codon pairs that realize the selected overhang at each position,
-    # preferring higher codon usage product.
+    # For each gene, choose concrete codon pairs that realize the selected overhang at each INTERNAL position
+    # (force codons for the two downstream amino acids: aa[cp] and aa[cp+1])
     forced_codons_by_gene: Dict[str, Dict[int, str]] = {}
-    for gene_id, aa in aa_records:
+    for gene_id, aa in aa_records_patched:
         aa = aa.strip()
         cuts = cut_points_by_gene[gene_id]
         forced: Dict[int, str] = {}
 
-        # Helper to map position index -> aa indices involved
-        def aa_indices_for_pos(pos_index: int) -> Tuple[int, int]:
-            if pos_index == 0:
-                return 0, 1
-            if pos_index == n_fragments:
-                return len(aa) - 2, len(aa) - 1
-            # internal pos: pos_index corresponds to cut point at cuts[pos_index-1]
-            cp = cuts[pos_index - 1]
-            return cp - 1, cp
-
-        for pos_index in range(0, n_fragments + 1):
+        for pos_index, cp in enumerate(cuts, start=1):
             oh = assign[pos_index]
             choices = per_gene_choices[gene_id][pos_index]
             if oh not in choices:
-                raise RuntimeError(f"Internal error: chosen overhang {oh} not feasible for gene {gene_id} pos {pos_index}")
+                raise RuntimeError(
+                    f"Internal error: chosen overhang {oh} not feasible for gene {gene_id} pos {pos_index}"
+                )
             choice = choices[oh]
-            iL, iR = aa_indices_for_pos(pos_index)
-            # Force codons for both amino acids at this boundary
-            forced[iL] = choice.left_codon
-            forced[iR] = choice.right_codon
+            # Force codons for the two downstream amino acids
+            forced[int(cp)] = choice.left_codon
+            forced[int(cp + 1)] = choice.right_codon
 
         forced_codons_by_gene[gene_id] = forced
 
-    return assign, forced_codons_by_gene
+    return assign, forced_codons_by_gene, aa_records_patched
 
 
 def run_pipeline(cfg: dict, outdir: Path):
@@ -178,14 +289,31 @@ def run_pipeline(cfg: dict, outdir: Path):
     seed_codonopt = effective_seed(cfg["codonopt"].get("seed"), cfg["defaults"]["default_seed"])
     seed_reasm = effective_seed(cfg["reassembly"].get("seed"), cfg["defaults"]["default_seed"])
 
-    aa_records = _load_aa_inputs(cfg)
+    aa_records_raw = _load_aa_inputs(cfg)
 
-    # Precompute AA fragments and cut points per gene
-    fragments_aa: List[Dict] = []
+    # Precompute cut points per gene
     cut_points_by_gene: Dict[str, List[int]] = {}
+    for gene_id, aa in aa_records_raw:
+        cut_points_by_gene[gene_id] = _get_cut_points_aa(cfg, gene_id)
+
+    # Build fragments_aa from AA records (NOTE: these may be patched by consensus during overhang selection)
+    # We'll regenerate fragments_aa after overhang selection to ensure we use aa_records_patched consistently.
+    # First, compute n_fragments from any gene's cuts:
+    any_gene = aa_records_raw[0][0]
+    n_fragments = len(cut_points_by_gene[any_gene]) + 1
+
+    # Choose GLOBAL overhangs per junction position (0..k) AND forced codons per gene/AA-index
+    overhang_by_pos, forced_codons_by_gene, aa_records = _select_global_overhangs_and_forced_codons(
+        cfg=cfg,
+        aa_records=aa_records_raw,
+        n_fragments=n_fragments,
+        cut_points_by_gene=cut_points_by_gene,
+    )
+
+    # Now build AA fragments using the possibly patched AA records
+    fragments_aa: List[Dict] = []
     for gene_id, aa in aa_records:
-        cut_points = _get_cut_points_aa(cfg, gene_id)
-        cut_points_by_gene[gene_id] = cut_points
+        cut_points = cut_points_by_gene[gene_id]
         frags = split_aa_by_cut_points(aa, cut_points)
         for i, (a, b, frag_aa) in enumerate(frags, start=1):
             fragments_aa.append(
@@ -197,37 +325,23 @@ def run_pipeline(cfg: dict, outdir: Path):
                     "aa_seq": frag_aa,
                 }
             )
-    n_fragments = max(int(f["frag_index"]) for f in fragments_aa)
-
-    # Choose GLOBAL overhangs per junction position (0..k) AND forced codons per gene/AA-index
-    overhang_by_pos, forced_codons_by_gene = _select_global_overhangs_and_forced_codons(
-        cfg=cfg,
-        aa_records=aa_records,
-        n_fragments=n_fragments,
-        cut_points_by_gene=cut_points_by_gene,
-    )
 
     # ---- Overhang audit output + crosstalk threshold ----
-    from frogger.overhangs import crosstalk_rows  # uses the pairing matrix
-    from frogger.common.io import write_tsv
+    from frogger.overhangs import crosstalk_rows
 
     gg = cfg.get("golden_gate", {}) or {}
-    # Prefer the stored selection (set inside the selector), but fall back to the returned mapping.
     assign = gg.get("_selected_overhangs_by_pos", overhang_by_pos)
     worst = gg.get("_selected_overhangs_worst_score", None)
 
-    # Write selected overhangs (pos 0..n_fragments)
     selected_rows = [{"pos_index": int(pos), "overhang": str(oh)} for pos, oh in sorted(assign.items())]
     write_tsv(Path(outdir) / "overhangs_selected.tsv", selected_rows)
 
-    # Write full pairwise cross-talk table
     df_matrix = load_pairing_matrix_xlsx(
         Path(gg["overhang_matrix_xlsx"]),
         sheet_name=gg.get("overhang_matrix_sheet"),
     )
     write_tsv(Path(outdir) / "overhang_crosstalk.tsv", crosstalk_rows(df_matrix, assign))
 
-    # Enforce threshold (default 0.1)
     max_allowed = float(gg.get("max_worst_crosstalk", 0.1))
     if worst is not None and float(worst) > max_allowed:
         raise RuntimeError(
@@ -272,18 +386,18 @@ def run_pipeline(cfg: dict, outdir: Path):
 
         fragments_cds.append(
             {
-                "fragment_id": frag_id,                 # NEW (stable ID for reporting)
+                "fragment_id": frag_id,
                 "gene_id": gene_id,
                 "frag_index": f["frag_index"],
                 "start": f["aa_start"],
                 "end": f["aa_end"],
                 "core_seq": patched_cds,
                 "aa_seq": f["aa_seq"],
-                "forced_codons_local": forced_local,    # NEW (needed for repair)
-                "aa_len": len(f["aa_seq"]),             # NEW (optional but handy)
+                "forced_codons_local": forced_local,
+                "aa_len": len(f["aa_seq"]),
             }
         )
-    
+
     # --- QC + repair pass on fragment core_seq (optional) -----------------------
     repair_cfg = (cfg.get("repair", {}) or {})
     if bool(repair_cfg.get("enable", False)):
@@ -294,20 +408,17 @@ def run_pipeline(cfg: dict, outdir: Path):
 
         def _translate_nt(nt: str) -> str:
             aa = str(Seq(nt).translate(to_stop=False))
-            # fragments should not contain stops; if they do, keep '*' so mismatch is caught
             return aa
 
         def _codonopt_runner(fragment_dict: dict):
-            # Re-run codonopt on the AA fragment only (deterministic seed)
             new_nt, _, _ = run_codonopt_for_fragment(
                 codonopt_cfg=c_cfg,
                 outdir=outdir,
                 seed=int(seed_codonopt),
-                fragment_id=str(fragment_dict["fragment_id"]) + f"__repair{1}",
+                fragment_id=str(fragment_dict["fragment_id"]) + "__repair",
                 aa_seq=str(fragment_dict["aa_seq"]),
             )
-            # return (new_nt, codonopt_version)
-            return new_nt, ""  # if you have version, return it here
+            return new_nt, ""
 
         fragments_cds, repair_rows = repair_fragments_loop(
             fragments_cds,
@@ -320,17 +431,37 @@ def run_pipeline(cfg: dict, outdir: Path):
         )
 
         if repair_rows:
-            repair_path = outdir / cfg["outputs"].get("repair_report_tsv", "repair_report.tsv")
+            repair_path = outdir / cfg.get("outputs", {}).get("repair_report_tsv", "repair_report.tsv")
             write_tsv(repair_path, repair_rows)
     # --------------------------------------------------------------------------
 
-    from frogger.primers import build_avoid_kmers, generate_primers_by_pos
+    # Primers / barcodes
+    from frogger.primers import build_avoid_kmers, generate_primers_by_pos, primers_from_barcodes
 
     primers_cfg = cfg.get("primers", {}) or {}
-    mode = (primers_cfg.get("mode") or "fixed").lower()
+    mode = (primers_cfg.get("mode") or "barcodes").lower()
 
     if mode == "fixed":
         primers_by_pos = primers_cfg.get("fixed_by_pos") or {}
+
+    elif mode == "barcodes":
+        # (6) Default to barcode 901 (forward) and 902 (reverse-complement)
+        b = primers_cfg.get("barcodes", {}) or {}
+        barcode_fasta = b.get("fasta") or b.get("fasta_path") or primers_cfg.get("barcodes_fasta")
+        if not barcode_fasta:
+            raise ValueError(
+                "primers.mode=barcodes requires primers.barcodes.fasta (path to FASTA with barcode IDs)."
+            )
+        primers_by_pos = primers_from_barcodes(
+            n_positions=n_fragments,
+            barcode_fasta=Path(barcode_fasta),
+            forward_id=str(b.get("forward_id", "901")),
+            reverse_id=str(b.get("reverse_id", "902")),
+            forward_seq=b.get("forward_seq"),
+            reverse_seq=b.get("reverse_seq"),
+            reverse_is_revcomp=bool(b.get("reverse_is_revcomp", True)),
+        )
+
     elif mode == "generate":
         g = primers_cfg.get("generate", {}) or {}
         k = int(g.get("max_internal_match", 12))
@@ -346,10 +477,12 @@ def run_pipeline(cfg: dict, outdir: Path):
             avoid_motifs=list(g.get("avoid_motifs", [])),
             seed=int(cfg.get("defaults", {}).get("default_seed", 1337)),
         )
+
     else:
         raise ValueError(f"Unknown primers.mode: {mode}")
 
-    # Build cloning sequences (primer + TypeIIS + OH + core + OH + TypeIIS + primer)
+    # Build cloning sequences (primer + TypeIIS + OH + core + revcomp(OH) + TypeIIS + primer)
+    # (3) The revcomp of the GG overhang is appended to the 3' end of each block in gg_adapters.build_cloning_seq.
     gg = cfg.get("golden_gate", {}) or {}
     enzyme = gg.get("enzyme", "BsaI")
     spacer_left = gg.get("spacer_left", "")

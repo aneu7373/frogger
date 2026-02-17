@@ -13,6 +13,11 @@ DNA = str
 class JunctionChoice:
     """
     Specifies a concrete codon pair and a 4-mer window within the 6 nt across the boundary.
+
+    NOTE: In unified FROGGER, junction overhang enumeration is driven by the amino-acid
+    context *downstream* of the cut (see packager.select_global_overhangs_and_forced_codons).
+    This helper simply enumerates feasible 4-mers from two adjacent amino acids given a
+    codon-usage table.
     """
     left_codon: str
     right_codon: str
@@ -30,24 +35,36 @@ def enumerate_boundary_overhangs(
     aa_right: str,
     codons: Dict[str, List[CodonEntry]],
     avoid_codons: Optional[Sequence[str]] = None,
+    top_k_codons: int = 2,
 ) -> Dict[str, JunctionChoice]:
     """
     For a boundary between aa_left and aa_right, enumerate all possible 4-mer overhangs
-    that can appear within the 6 nt formed by (codon_left + codon_right), considering synonymous codons.
+    that can appear within the 6 nt formed by (codon_left + codon_right), considering
+    synonymous codons.
 
-    Returns mapping overhang -> best JunctionChoice (best by score).
+    Key update:
+      - Restrict synonymous-codon enumeration to the top-K most frequent codons per AA
+        (default K=2). This keeps the overhang search focused on highly used codons.
+
+    Returns mapping: overhang -> best JunctionChoice (best by score).
     """
     avoid = set([c.upper() for c in (avoid_codons or [])])
     if aa_left not in codons or aa_right not in codons:
         raise ValueError(f"Missing codons for AA boundary {aa_left}-{aa_right} in codon table.")
 
+    k = max(1, int(top_k_codons))
+    left_list = [ce for ce in codons[aa_left] if ce.codon.upper() not in avoid][:k]
+    right_list = [ce for ce in codons[aa_right] if ce.codon.upper() not in avoid][:k]
+
+    if not left_list or not right_list:
+        raise ValueError(
+            f"No usable codons after filtering for AA boundary {aa_left}-{aa_right} "
+            f"(avoid_codons may be too strict)."
+        )
+
     best: Dict[str, JunctionChoice] = {}
-    for cl in codons[aa_left]:
-        if cl.codon in avoid:
-            continue
-        for cr in codons[aa_right]:
-            if cr.codon in avoid:
-                continue
+    for cl in left_list:
+        for cr in right_list:
             six = (cl.codon + cr.codon).upper()
             base_score = float(cl.fraction) * float(cr.fraction)
             for off, oh in _windows_4mer(six):

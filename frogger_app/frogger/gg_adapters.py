@@ -5,10 +5,17 @@ from typing import Dict, List, Optional
 from frogger.overhangs import revcomp
 
 
+# Recognition sequences only (Type IIS).
+# Adapter construction assumes:
+#   primer_left + site + spacer_left + left_overhang + core +
+#   revcomp(right_overhang) + spacer_right + revcomp(site) + primer_right
+#
+# PaqCI recognition is CACCTGC; NEB lists cut as CACCTGC(4/8) producing a 4-bp overhang.
 ENZYMES = {
     "BSAI": "GGTCTC",
     "BBSI": "GAAGAC",
     "BSMBI": "CGTCTC",
+    "PAQCI": "CACCTGC",
 }
 
 
@@ -44,15 +51,31 @@ def build_cloning_seq(
     spacer_left: str = "",
     spacer_right: str = "",
 ) -> Dict[str, str]:
+    """
+    Build a Golden Gate cloning block.
+
+    IMPORTANT:
+      - The 3' side of a fragment must carry the *reverse complement* of the downstream overhang
+        so that, after Type IIS digestion, the sticky ends match the intended assembly overhangs.
+
+    Convention:
+      - left_overhang / right_overhang are stored in forward orientation (designed 4-mer labels).
+      - We append revcomp(right_overhang) to the 3' end of the fragment block.
+    """
     site = enzyme_site(enzyme)
+    left_overhang = str(left_overhang).upper()
+    right_overhang = str(right_overhang).upper()
+    right_overhang_rc = revcomp(right_overhang)
+
     left = f"{primer_left}{site}{spacer_left}{left_overhang}"
     right_site = revcomp(site)
-    right = f"{right_overhang}{spacer_right}{right_site}{primer_right}"
+    right = f"{right_overhang_rc}{spacer_right}{right_site}{primer_right}"
     return {
         "primer_left": primer_left,
         "primer_right": primer_right,
         "left_overhang": left_overhang,
         "right_overhang": right_overhang,
+        "right_overhang_rc": right_overhang_rc,
         "left_adapter": left,
         "right_adapter": right,
         "cloning_seq": f"{left}{core_seq}{right}",
