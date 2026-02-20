@@ -231,16 +231,31 @@ def run_pipeline(config_path: str, outdir: str) -> None:
     workdir = os.path.dirname(os.path.abspath(config_path)) or "."
 
     inputs = cfg.get("inputs", {}) or {}
-    input_fasta = inputs.get("fasta")
-    input_type = str(inputs.get("input_type", "protein")).strip().lower()
 
+    # Accept unified names as well as legacy mutate name.
+    # Priority:
+    #   1) inputs.fasta         (legacy mutate)
+    #   2) inputs.aa_fasta      (unified)
+    #   3) inputs.protein_fasta (alias)
+    #   4) codonopt.sequence    (legacy codonopt-driven)
+    input_fasta = (
+        inputs.get("fasta")
+        or inputs.get("aa_fasta")
+        or inputs.get("protein_fasta")
+        or (cfg.get("codonopt", {}) or {}).get("sequence")
+    )
+
+    input_type = str(inputs.get("input_type", "protein")).strip().lower()
     if input_type not in ("protein", "cds"):
         raise ValueError("inputs.input_type must be 'protein' or 'cds'.")
 
     if not input_fasta:
-        raise ValueError("inputs.fasta is required.")
+        raise ValueError(
+            "One of inputs.fasta / inputs.aa_fasta (or codonopt.sequence) is required."
+        )
 
-    input_fasta_path = os.path.join(workdir, input_fasta)
+    input_fasta_path = os.path.join(workdir, str(input_fasta))
+
 
     codonopt_cfg = cfg.get("codonopt", {}) or {}
     codonopt_enable = bool(codonopt_cfg.get("enable", True))
@@ -357,7 +372,7 @@ def run_pipeline(config_path: str, outdir: str) -> None:
         cut_points_by_gene = {gene_id: cut_points}
 
         # Choose overhangs globally using shuffle feasibility + matrix crosstalk minimization
-        overhang_by_pos, forced_codons_by_gene = select_global_overhangs_and_forced_codons(
+        overhang_by_pos, forced_codons_by_gene, _aa_records_patched = select_global_overhangs_and_forced_codons(
             cfg=cfg,
             aa_records=aa_records,
             n_fragments=n_frags,

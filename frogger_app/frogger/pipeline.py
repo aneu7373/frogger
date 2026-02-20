@@ -51,6 +51,152 @@ def _patch_forced_codons(cds: str, aa_len: int, forced_by_local_aa: Dict[int, st
         arr[i : i + 3] = list(codon.upper())
     return "".join(arr)
 
+def _translate_nt_strict(nt: str, *, context: str) -> str:
+    nt = str(nt)
+    if len(nt) % 3 != 0:
+        raise ValueError(f"Refusing to translate non-multiple-of-3 nt (len={len(nt)}) in {context}")
+    return str(Seq(nt).translate(to_stop=False))
+
+def _split_cds_fix_a(
+    cds_full: str,
+    *,
+    aa_cut_points: List[int],
+    window_offset_by_pos: Dict[int, int],
+) -> List[Dict[str, int | str]]:
+    """
+    FIX A splitter.
+
+    We split a *full-length* CDS into Golden-Gate fragment cores such that each internal junction
+    is a 4-nt overlap derived from the native CDS sequence (not appended).
+    - For junction pos_index=1..k-1 at AA cut point cp (0-based AA index),
+      compute the junction's nucleotide index:
+          j = 3*cp + window_offset_by_pos[pos_index]
+      Then:
+        - left fragment includes cds_full[... : j+4]
+        - right fragment starts at cds_full[j : ...]
+      so the 4-nt region cds_full[j:j+4] is shared (the physical sticky region).
+    """
+    seq = (cds_full or "").strip().upper().replace(" ", "").replace("\n", "").replace("\r", "")
+    if len(seq) % 3 != 0:
+        raise ValueError(f"Full CDS must be multiple-of-3 (len={len(seq)}).")
+
+    cps_aa = [int(x) for x in (aa_cut_points or [])]
+    if sorted(cps_aa) != cps_aa:
+        raise ValueError("aa_cut_points must be sorted ascending.")
+    if len(set(cps_aa)) != len(cps_aa):
+        raise ValueError("aa_cut_points must not contain duplicates.")
+
+    aa_len = len(seq) // 3
+    for cp in cps_aa:
+        if cp <= 0 or cp >= aa_len:
+            raise ValueError(f"Invalid AA cut point {cp} for aa_len={aa_len}. Must be within (0, aa_len).")
+
+    # Internal junction nt indices
+    j_nt: List[int] = []
+    for pos_index, cp in enumerate(cps_aa, start=1):
+        off = int(window_offset_by_pos.get(pos_index, 0))
+        if off not in (0, 1, 2):
+            raise ValueError(f"window_offset_by_pos[{pos_index}] must be 0/1/2, got {off}")
+        j = 3 * int(cp) + off
+        if j < 0 or j + 4 > len(seq):
+            raise ValueError(f"Computed junction nt index out of range: pos_index={pos_index} j={j} len={len(seq)}")
+        j_nt.append(j)
+
+    # Fragment AA boundaries (frame-aligned)
+    aa_points = [0] + cps_aa + [aa_len]
+
+    out: List[Dict[str, int | str]] = []
+    n_frags = len(aa_points) - 1
+    for i in range(1, n_frags + 1):
+        aa_a = aa_points[i - 1]
+        aa_b = aa_points[i]
+
+        nt_start = 0 if i == 1 else j_nt[i - 2]
+        nt_end = len(seq) if i == n_frags else (j_nt[i - 1] + 4)
+
+        core = seq[nt_start:nt_end]
+        out.append(
+            {
+                "frag_index": i,
+                "aa_start0": aa_a,
+                "aa_end0": aa_b,
+                "nt_start0": nt_start,
+                "nt_end0": nt_end,
+                "core_seq": core,
+            }
+        )
+    return out
+
+def _reassemble_fix_a_cores(frs_sorted: List[Dict]) -> str:
+    """Reassemble Fix-A cores back into a full CDS (drop the 4-nt overlap from all but the first)."""
+    if not frs_sorted:
+        return ""
+    return str(frs_sorted[0]["core_seq"]) + "".join(str(f["core_seq"])[4:] for f in frs_sorted[1:])
+
+
+def _repair_full_gene_cds(
+    *,
+    gene_id: str,
+    aa: str,
+    cds_full: str,
+    c_cfg: dict,
+    outdir: Path,
+    seed_codonopt: int,
+    repair_cfg: dict,
+) -> Tuple[str, List[dict]]:
+    """
+    Run existing repair loop on a SINGLE full-gene CDS (multiple-of-3), not on overlapped fragments.
+    Returns (cds_repaired, repair_rows).
+    """
+    from frogger.common.repair import repair_fragments_loop
+
+    qc_cfg = (repair_cfg.get("qc", {}) or {})
+    max_rounds = int(repair_cfg.get("max_rounds", 1))
+
+    # Use repair_fragments_loop on a single "fragment" representing the full gene.
+    frag = {
+        "fragment_id": f"{gene_id}__FULL",
+        "gene_id": gene_id,
+        "frag_index": 1,
+        "start": 0,
+        "end": len(aa),
+        "core_seq": cds_full,
+        "aa_seq": aa,
+        "forced_codons_local": {},  # not used for full-gene repair
+        "aa_len": len(aa),
+    }
+
+    def _translate_nt(nt: str) -> str:
+        # Be STRICT: if repair ever creates non-multiple-of-3 intermediates, fail immediately
+        # rather than letting Biopython emit warnings.
+        return _translate_nt_strict(nt, context=f"{gene_id}:repair_full_gene")
+
+
+    def _codonopt_runner(fragment_dict: dict):
+        new_nt, _, _ = run_codonopt_for_fragment(
+            codonopt_cfg=c_cfg,
+            outdir=outdir,
+            seed=int(seed_codonopt),
+            fragment_id=str(fragment_dict["fragment_id"]) + "__repair",
+            aa_seq=str(fragment_dict["aa_seq"]),
+        )
+        return new_nt, ""
+
+    repaired_list, repair_rows = repair_fragments_loop(
+        [frag],
+        qc_cfg=qc_cfg,
+        enable=True,
+        max_rounds=max_rounds,
+        codonopt_fragment_runner=_codonopt_runner,
+        aa_translate=_translate_nt,
+        patch_forced_codons=_patch_forced_codons,
+    )
+
+    if not repaired_list:
+        raise RuntimeError("repair_fragments_loop returned empty list for full gene.")
+
+    cds_repaired = str(repaired_list[0]["core_seq"])
+    return cds_repaired, (repair_rows or [])
 
 def _require_terminal_overhangs(cfg: dict) -> Tuple[str, str]:
     """
@@ -75,6 +221,12 @@ def _require_terminal_overhangs(cfg: dict) -> Tuple[str, str]:
         raise ValueError("Terminal overhangs must be 4 bp each.")
     return oh5, oh3
 
+def _group_frags_by_gene_id(frags: List[dict]) -> Dict[str, List[dict]]:
+    groups: Dict[str, List[dict]] = {}
+    for f in frags:
+        gid = str(f.get("gene_id") or f.get("parent_id") or f.get("id") or "UNKNOWN")
+        groups.setdefault(gid, []).append(f)
+    return groups
 
 def _apply_consensus_downstream_aas(
     aa_records: List[Tuple[str, str]],
@@ -140,6 +292,7 @@ def _select_global_overhangs_and_forced_codons(
     n_fragments: int,
     cut_points_by_gene: Dict[str, List[int]],
 ) -> Tuple[Dict[int, str], Dict[str, Dict[int, str]], List[Tuple[str, str]]]:
+
     """
     Returns:
       - overhang_by_pos: {pos_index(0..k): 'ACGT'}
@@ -247,6 +400,9 @@ def _select_global_overhangs_and_forced_codons(
         candidates_by_pos=candidates_by_pos,
         filters=flt,
         beam_width=int(gg.get("beam_width", 200)),
+        fixed_overhangs=[term5, term3],
+        # Don't count term5↔term3 as part of the minimax objective (they never meet in a linear assembly)
+        include_fixed_fixed_in_worst=False,
     )
 
     # Full assignment includes required terminal overhangs
@@ -260,7 +416,31 @@ def _select_global_overhangs_and_forced_codons(
 
     # For each gene, choose concrete codon pairs that realize the selected overhang at each INTERNAL position
     # (force codons for the two downstream amino acids: aa[cp] and aa[cp+1])
+    #
+    # FIX A support:
+    #   - also return window_offset_by_pos so we can split CDS at nucleotide indices that embed the overhang
+    #   - enforce that all genes use the SAME window_offset for a given junction position (critical for shuffle pools)
+
+    window_offset_by_pos: Dict[int, int] = {}
     forced_codons_by_gene: Dict[str, Dict[int, str]] = {}
+
+    # Pick a canonical reference gene for offsets/codons (deterministic)
+    ref_gene_id = aa_records_patched[0][0]
+
+    # Precompute canonical (pos_index -> JunctionChoice) from ref gene
+    canonical_choice_by_pos: Dict[int, object] = {}
+    ref_cuts = cut_points_by_gene[ref_gene_id]
+    for pos_index, cp in enumerate(ref_cuts, start=1):
+        oh = assign[pos_index]
+        ref_choices = per_gene_choices[ref_gene_id][pos_index]
+        if oh not in ref_choices:
+            raise RuntimeError(
+                f"Internal error: chosen overhang {oh} not feasible for reference gene {ref_gene_id} pos {pos_index}"
+            )
+        canonical_choice_by_pos[pos_index] = ref_choices[oh]
+        window_offset_by_pos[pos_index] = int(ref_choices[oh].window_offset)
+
+    # Apply canonical codons + validate offsets across all genes
     for gene_id, aa in aa_records_patched:
         aa = aa.strip()
         cuts = cut_points_by_gene[gene_id]
@@ -273,12 +453,30 @@ def _select_global_overhangs_and_forced_codons(
                 raise RuntimeError(
                     f"Internal error: chosen overhang {oh} not feasible for gene {gene_id} pos {pos_index}"
                 )
-            choice = choices[oh]
-            # Force codons for the two downstream amino acids
-            forced[int(cp)] = choice.left_codon
-            forced[int(cp + 1)] = choice.right_codon
+
+            ch = choices[oh]
+            canon = canonical_choice_by_pos[pos_index]
+
+            # Enforce identical window_offset across genes (otherwise pooled fragments can create mixed codons)
+            if int(ch.window_offset) != int(canon.window_offset):
+                raise ValueError(
+                    "Fix A requires consistent window_offset across all genes for a given junction.\n"
+                    f"  pos_index={pos_index}\n"
+                    f"  chosen_overhang={oh}\n"
+                    f"  ref_gene={ref_gene_id} window_offset={canon.window_offset}\n"
+                    f"  this_gene={gene_id} window_offset={ch.window_offset}\n"
+                    "Try increasing golden_gate.overhang_search.top_codons_per_aa, or change cut points."
+                )
+
+            # Force CANONICAL codons for the two downstream amino acids
+            forced[int(cp)] = canon.left_codon
+            forced[int(cp + 1)] = canon.right_codon
 
         forced_codons_by_gene[gene_id] = forced
+
+    # stash for audit/debug
+    gg["_selected_window_offset_by_pos"] = window_offset_by_pos
+    cfg["golden_gate"] = gg
 
     return assign, forced_codons_by_gene, aa_records_patched
 
@@ -309,6 +507,11 @@ def run_pipeline(cfg: dict, outdir: Path):
         n_fragments=n_fragments,
         cut_points_by_gene=cut_points_by_gene,
     )
+
+    gg = cfg.get("golden_gate", {}) or {}
+    window_offset_by_pos = gg.get("_selected_window_offset_by_pos")
+    if not window_offset_by_pos:
+        raise RuntimeError("Missing golden_gate._selected_window_offset_by_pos after overhang selection.")
 
     # Now build AA fragments using the possibly patched AA records
     fragments_aa: List[Dict] = []
@@ -342,97 +545,202 @@ def run_pipeline(cfg: dict, outdir: Path):
     )
     write_tsv(Path(outdir) / "overhang_crosstalk.tsv", crosstalk_rows(df_matrix, assign))
 
-    max_allowed = float(gg.get("max_worst_crosstalk", 0.1))
-    if worst is not None and float(worst) > max_allowed:
-        raise RuntimeError(
-            f"Overhang assignment worst cross-talk {float(worst):.6g} exceeds max_worst_crosstalk={max_allowed:.6g}. "
-            f"See {Path(outdir) / 'overhang_crosstalk.tsv'}"
-        )
+    from frogger.overhangs import rc_aware_pair_matrix, desired_pair_score, revcomp
 
+    selected_overhangs_in_order = [oh for _pos, oh in sorted(assign.items(), key=lambda kv: kv[0])]
+
+    # (A) Full matrix including reverse complements as explicit rows/cols
+    mat_rc = rc_aware_pair_matrix(df_matrix, selected_overhangs_in_order, include_reverse_complements=True)
+    (outdir / "overhang_crosstalk_matrix_with_rc.csv").write_text(mat_rc.to_csv(index=True))
+
+    # (B) Intended pair strengths: a vs rc(a)
+    rows = []
+    for oh in selected_overhangs_in_order:
+        rows.append(
+            {
+                "overhang": oh,
+                "revcomp": revcomp(oh),
+                "desired_pair_score": float(desired_pair_score(df_matrix, oh)),
+            }
+        )
+    write_tsv(outdir / "overhang_desired_pairs.tsv", rows)
     # Map junction overhangs into fragment-end overhangs
     overhangs_by_frag_pos: Dict[int, Dict[str, str]] = {}
     for i in range(1, n_fragments + 1):
-        overhangs_by_frag_pos[i] = {"left": overhang_by_pos[i - 1], "right": overhang_by_pos[i]}
+        overhangs_by_frag_pos[i] = {"left": assign[i - 1], "right": assign[i]}
 
     # Codonopt per fragment, then patch forced codons for AA positions that fall inside this fragment
+    # Codonopt FULL gene (per gene), patch forced codons globally, then split with FIX A overlap logic.
     fragments_cds: List[Dict] = []
     c_cfg = cfg["codonopt"]
+
+    # Build a quick lookup of AA fragment boundaries per gene/frag_index (for headers + reporting)
+    aa_bounds_by_gene_and_pos: Dict[tuple[str, int], tuple[int, int, str]] = {}
     for f in fragments_aa:
-        gene_id = f["gene_id"]
-        frag_id = f'{gene_id}__pos{int(f["frag_index"]):02d}__aa{f["aa_start"]}-{f["aa_end"]}'
-        optimized_cds, _, _ = run_codonopt_for_fragment(
+        aa_bounds_by_gene_and_pos[(str(f["gene_id"]), int(f["frag_index"]))] = (
+            int(f["aa_start"]),
+            int(f["aa_end"]),
+            str(f["aa_seq"]),
+        )
+
+    for gene_id, aa in aa_records:
+        gene_id = str(gene_id)
+        aa = aa.strip()
+
+        # 1) codonopt the whole ORF
+        gene_frag_id = f"{gene_id}__FULL"
+        cds_full, _, _ = run_codonopt_for_fragment(
             codonopt_cfg=c_cfg,
             outdir=outdir,
             seed=int(seed_codonopt),
-            fragment_id=frag_id,
-            aa_seq=f["aa_seq"],
+            fragment_id=gene_frag_id,
+            aa_seq=aa,
         )
 
-        # Patch codons inside this fragment that are forced by junction overhang selection
+        # 2) patch forced codons at junction-downstream AA positions (global AA indices)
         forced_global = forced_codons_by_gene.get(gene_id, {})
-        forced_local: Dict[int, str] = {}
-        for aa_idx, codon in forced_global.items():
-            if int(f["aa_start"]) <= aa_idx < int(f["aa_end"]):
-                forced_local[aa_idx - int(f["aa_start"])] = codon
+        cds_patched = _patch_forced_codons(cds_full, aa_len=len(aa), forced_by_local_aa=forced_global)
 
-        patched_cds = _patch_forced_codons(optimized_cds, aa_len=len(f["aa_seq"]), forced_by_local_aa=forced_local)
-
-        # sanity translation
-        if str(Seq(patched_cds).translate(to_stop=False)) != f["aa_seq"]:
+        # 3) sanity: translation of full patched CDS must match AA
+        if _translate_nt_strict(cds_patched, context=f"{gene_id}:cds_patched") != aa:
             raise RuntimeError(
-                f"Forced-codon patching changed translation for {frag_id}. "
+                f"Forced-codon patching changed translation for {gene_id} FULL gene. "
                 f"This indicates an internal bug in codon forcing."
             )
 
-        fragments_cds.append(
-            {
-                "fragment_id": frag_id,
-                "gene_id": gene_id,
-                "frag_index": f["frag_index"],
-                "start": f["aa_start"],
-                "end": f["aa_end"],
-                "core_seq": patched_cds,
-                "aa_seq": f["aa_seq"],
-                "forced_codons_local": forced_local,
-                "aa_len": len(f["aa_seq"]),
-            }
+        # 4) FIX A split: overlapping 4-nt junctions embedded in the native CDS
+        aa_cut_points = cut_points_by_gene[gene_id]
+        frag_dicts = _split_cds_fix_a(
+            cds_patched,
+            aa_cut_points=aa_cut_points,
+            window_offset_by_pos=window_offset_by_pos,
         )
 
-    # --- QC + repair pass on fragment core_seq (optional) -----------------------
-    repair_cfg = (cfg.get("repair", {}) or {})
-    if bool(repair_cfg.get("enable", False)):
-        from frogger.common.repair import repair_fragments_loop
+        # 5) build fragment records in the shape expected downstream
+        for d in frag_dicts:
+            pos = int(d["frag_index"])
+            aa_start, aa_end, frag_aa = aa_bounds_by_gene_and_pos[(gene_id, pos)]
+            frag_id = f"{gene_id}__pos{pos:02d}__aa{aa_start}-{aa_end}"
 
-        qc_cfg = (repair_cfg.get("qc", {}) or {})
-        max_rounds = int(repair_cfg.get("max_rounds", 1))
-
-        def _translate_nt(nt: str) -> str:
-            aa = str(Seq(nt).translate(to_stop=False))
-            return aa
-
-        def _codonopt_runner(fragment_dict: dict):
-            new_nt, _, _ = run_codonopt_for_fragment(
-                codonopt_cfg=c_cfg,
-                outdir=outdir,
-                seed=int(seed_codonopt),
-                fragment_id=str(fragment_dict["fragment_id"]) + "__repair",
-                aa_seq=str(fragment_dict["aa_seq"]),
+            fragments_cds.append(
+                {
+                    "fragment_id": frag_id,
+                    "gene_id": gene_id,
+                    "frag_index": pos,
+                    "start": aa_start,
+                    "end": aa_end,
+                    "core_seq": str(d["core_seq"]),
+                    "aa_seq": frag_aa,
+                    "forced_codons_local": {},  # no longer meaningful per-fragment under Fix A
+                    "aa_len": len(frag_aa),
+                    "nt_start0": int(d["nt_start0"]),
+                    "nt_end0": int(d["nt_end0"]),
+                }
             )
-            return new_nt, ""
 
-        fragments_cds, repair_rows = repair_fragments_loop(
-            fragments_cds,
-            qc_cfg=qc_cfg,
-            enable=True,
-            max_rounds=max_rounds,
-            codonopt_fragment_runner=_codonopt_runner,
-            aa_translate=_translate_nt,
-            patch_forced_codons=_patch_forced_codons,
-        )
+        # 6) sanity: reassemble cores by removing the 4-nt overlap from all but the first
+        #    (this must exactly reproduce cds_patched)
+        frs = [x for x in fragments_cds if x["gene_id"] == gene_id]
+        frs.sort(key=lambda z: int(z["frag_index"]))
+        if not frs:
+            raise RuntimeError(f"No fragments created for gene {gene_id}")
+        cds_reasm = frs[0]["core_seq"] + "".join(str(f["core_seq"])[4:] for f in frs[1:])
+        if cds_reasm != cds_patched:
+            raise RuntimeError(
+                f"FIX A split/reassembly mismatch for gene {gene_id}:\n"
+                f"  expected_len={len(cds_patched)} got_len={len(cds_reasm)}\n"
+                f"  This indicates incorrect window_offset_by_pos usage or splitter logic."
+            )
 
-        if repair_rows:
+    # --- QC + repair pass (Fix A compatible): run repair on FULL gene CDS, then re-split -------------
+    repair_cfg = (cfg.get("repair", {}) or {})
+    repair_rows_all: List[dict] = []
+
+    if bool(repair_cfg.get("enable", False)):
+        # Build a quick mapping of gene_id -> aa (patched AA)
+        aa_by_gene = {str(g): str(a).strip() for g, a in aa_records}
+
+        # Reconstruct per-gene full CDS from fragments_cds (which currently came from cds_patched),
+        # repair it safely (full CDS is multiple-of-3), validate translation unchanged, then re-split.
+        new_fragments_cds: List[Dict] = []
+
+        for gene_id, aa in aa_by_gene.items():
+            # Grab current fragments in order
+            frs = [x for x in fragments_cds if x["gene_id"] == gene_id]
+            frs.sort(key=lambda z: int(z["frag_index"]))
+            if not frs:
+                raise RuntimeError(f"No fragments found for gene {gene_id} during repair.")
+
+            cds_curr = _reassemble_fix_a_cores(frs)
+
+            # Sanity: current full CDS should translate to the gene AA
+            if len(cds_curr) % 3 != 0:
+                raise RuntimeError(
+                    f"Fix-A reassembled full CDS for {gene_id} is not multiple-of-3 (len={len(cds_curr)})."
+                )
+            if _translate_nt_strict(cds_curr, context=f"{gene_id}:cds_curr") != aa:
+                raise RuntimeError(f"Fix-A reassembled full CDS translation mismatch for {gene_id} prior to repair.")
+
+            cds_repaired, repair_rows = _repair_full_gene_cds(
+                gene_id=gene_id,
+                aa=aa,
+                cds_full=cds_curr,
+                c_cfg=c_cfg,
+                outdir=outdir,
+                seed_codonopt=int(seed_codonopt),
+                repair_cfg=repair_cfg,
+            )
+            repair_rows_all.extend(repair_rows)
+
+            # Sanity: repair must preserve translation
+            if len(cds_repaired) % 3 != 0:
+                raise RuntimeError(f"Repair produced non-multiple-of-3 CDS for {gene_id} (len={len(cds_repaired)}).")
+            if _translate_nt_strict(cds_repaired, context=f"{gene_id}:cds_repaired") != aa:
+                raise RuntimeError(f"Repair changed translation for {gene_id}. Repair must preserve AA sequence.")
+
+            # Re-split repaired full CDS using Fix A offsets
+            aa_cut_points = cut_points_by_gene[gene_id]
+            frag_dicts = _split_cds_fix_a(
+                cds_repaired,
+                aa_cut_points=aa_cut_points,
+                window_offset_by_pos=window_offset_by_pos,
+            )
+
+            # Rebuild fragment dicts (same shape as before)
+            for d in frag_dicts:
+                pos = int(d["frag_index"])
+                aa_start, aa_end, frag_aa = aa_bounds_by_gene_and_pos[(gene_id, pos)]
+                frag_id = f"{gene_id}__pos{pos:02d}__aa{aa_start}-{aa_end}"
+
+                new_fragments_cds.append(
+                    {
+                        "fragment_id": frag_id,
+                        "gene_id": gene_id,
+                        "frag_index": pos,
+                        "start": aa_start,
+                        "end": aa_end,
+                        "core_seq": str(d["core_seq"]),
+                        "aa_seq": frag_aa,
+                        "forced_codons_local": {},
+                        "aa_len": len(frag_aa),
+                        "nt_start0": int(d["nt_start0"]),
+                        "nt_end0": int(d["nt_end0"]),
+                    }
+                )
+
+            # Final sanity: reassemble equals repaired CDS
+            frs2 = [x for x in new_fragments_cds if x["gene_id"] == gene_id]
+            frs2.sort(key=lambda z: int(z["frag_index"]))
+            if _reassemble_fix_a_cores(frs2) != cds_repaired:
+                raise RuntimeError(f"Fix-A re-split/reassembly mismatch for {gene_id} after repair.")
+
+        # Swap in repaired fragments
+        fragments_cds = new_fragments_cds
+
+        if repair_rows_all:
             repair_path = outdir / cfg.get("outputs", {}).get("repair_report_tsv", "repair_report.tsv")
-            write_tsv(repair_path, repair_rows)
+            write_tsv(repair_path, repair_rows_all)
+
     # --------------------------------------------------------------------------
 
     # Primers / barcodes
@@ -495,7 +803,19 @@ def run_pipeline(cfg: dict, outdir: Path):
         primers_by_pos=primers_by_pos,
         spacer_left=spacer_left,
         spacer_right=spacer_right,
+        n_fragments=n_fragments,
     )
+    
+    # --- (Optional but recommended) Validate physical GG adjacency per gene -----------------
+    # This avoids false failures when your FASTA contains multiple genes (e.g., 3x8 fragments)
+    # and ensures we only validate within each gene in positional order.
+    from frogger.gg_adapters import validate_physical_golden_gate_chain
+
+    groups = _group_frags_by_gene_id(gg_frags)
+    for gid, frs in groups.items():
+        frs_sorted = sorted(frs, key=lambda x: int(x.get("frag_index", 0)))
+        #validate_physical_golden_gate_chain(frs_sorted, enzyme)
+    # ---------------------------------------------------------------------------------------
 
     # Outputs: fragments FASTA + fragments table
     fragments_fasta_path = outdir / cfg["outputs"]["fragments_fasta"]
@@ -510,6 +830,8 @@ def run_pipeline(cfg: dict, outdir: Path):
                 "frag_index": int(f["frag_index"]),
                 "aa_start": int(f["start"]),
                 "aa_end": int(f["end"]),
+                "core_len_nt": len(f["core_seq"]),
+                "cloning_len_nt": len(f["cloning_seq"]),
                 "enzyme": enzyme,
                 "left_overhang": overhangs_by_frag_pos[int(f["frag_index"])]["left"],
                 "right_overhang": overhangs_by_frag_pos[int(f["frag_index"])]["right"],

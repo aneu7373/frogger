@@ -217,13 +217,23 @@ def select_global_overhangs_and_forced_codons(
         min_gc=float(flt_cfg.get("min_gc", 0.25)),
         max_gc=float(flt_cfg.get("max_gc", 0.75)),
         max_homopolymer=int(flt_cfg.get("max_homopolymer", 3)),
+        # Optional: explicitly ban certain 4-mers (helps eliminate matrix “landmines” like CATT)
+        disallow_overhangs=tuple(str(x).upper().strip() for x in (flt_cfg.get("disallow_overhangs", []) or [])),
     )
+
+    # Include fixed terminal overhangs inside the optimizer objective so internal picks cannot
+    # massively cross-talk with AATG/GCTT (or collide via reverse complements).
+    # Optionally ignore terminal↔terminal cross-talk in the worst-score objective, since those
+    # ends generally ligate to a vector backbone rather than to each other.
+    ignore_tt = bool(gg.get("ignore_terminal_terminal_crosstalk", True))
 
     internal_assign, worst = choose_overhangs_by_position(
         df=df,
         candidates_by_pos=candidates_by_pos,
         filters=flt,
         beam_width=int(gg.get("beam_width", 200)),
+        fixed_overhangs=[term5, term3],
+        include_fixed_fixed_in_worst=(not ignore_tt),
     )
 
     assign: Dict[int, str] = {0: term5, n_fragments: term3}

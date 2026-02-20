@@ -47,12 +47,23 @@ def check_construct(
     fails = []
     hit_rows = []
 
-    if require_len_multiple_of_3 and (len(seq) % 3 != 0):
+    if len(seq) % 3 != 0:
         fails.append("len_not_multiple_of_3")
+        if require_len_multiple_of_3:
+            # hard fail so we don't silently continue with a broken ORF
+            return {
+                "passes_all": False,
+                "fail_reasons": fails,
+                "gc_fraction": (seq.count("G") + seq.count("C")) / max(1, len(seq)),
+                "max_homopolymer": _max_homopolymer(seq),
+                "aa_len": 0,
+                "hits": [],
+            }
 
     aa = str(Seq(seq).translate(to_stop=False))
-    if require_no_internal_stops and ("*" in aa[:-1]):  # allow terminal stop
+    if require_no_internal_stops and ("*" in aa[:-1]):
         fails.append("internal_stop_codon")
+
 
     # homopolymer
     hp = _max_homopolymer(seq)

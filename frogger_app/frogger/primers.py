@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Optional, Set
 
 DNA = str
 
@@ -165,17 +165,53 @@ def primers_from_barcodes(
       - right primer = reverse-complement(barcode 902)
 
     If forward_seq/reverse_seq are provided, those override the FASTA lookup.
+
+    Robust ID handling:
+      - strips a leading '>' if the user accidentally includes it
+      - allows numeric IDs (e.g. "901") to resolve to "bc25mer_901" if present
+      - allows legacy shorthand "bcmer_901" to resolve to "bc25mer_901" if present
     """
     bcs = load_barcodes_fasta(Path(barcode_fasta))
 
+    def _norm_id(x: str) -> str:
+        x = str(x).strip()
+        if x.startswith(">"):
+            x = x[1:].strip()
+        return x
+
+    def _resolve_id(x: str) -> str:
+        x = _norm_id(x)
+
+        # Exact match?
+        if x in bcs:
+            return x
+
+        # Numeric ID -> try bc25mer_<id>
+        if x.isdigit():
+            alt = f"bc25mer_{x}"
+            if alt in bcs:
+                return alt
+
+        # Shorthand bcmer_### -> bc25mer_###
+        if x.startswith("bcmer_"):
+            alt = "bc25mer_" + x[len("bcmer_") :]
+            if alt in bcs:
+                return alt
+
+        return x
+
+    forward_id = _resolve_id(forward_id)
+    reverse_id = _resolve_id(reverse_id)
+
     if forward_seq is None:
-        if str(forward_id) not in bcs:
+        if forward_id not in bcs:
             raise ValueError(f"Forward barcode id '{forward_id}' not found in {barcode_fasta}")
-        forward_seq = bcs[str(forward_id)]
+        forward_seq = bcs[forward_id]
+
     if reverse_seq is None:
-        if str(reverse_id) not in bcs:
+        if reverse_id not in bcs:
             raise ValueError(f"Reverse barcode id '{reverse_id}' not found in {barcode_fasta}")
-        reverse_seq = bcs[str(reverse_id)]
+        reverse_seq = bcs[reverse_id]
 
     forward_seq = str(forward_seq).upper().replace("U", "T")
     reverse_seq = str(reverse_seq).upper().replace("U", "T")
