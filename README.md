@@ -30,7 +30,7 @@ Given protein sequences (and a configuration describing split points and GG cons
 
 From the repo root:
 
-    docker build -t frogger:1.0 .
+    docker build -t frogger:1.1.1 .
 
 ### Run (recommended workflow)
 
